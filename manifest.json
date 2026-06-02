@@ -1,12 +1,16 @@
 {
   "name": "zo-skills",
   "description": "Zo Computer skills library",
-  "tarball_url": "https://github.com/vrijenattawar/zo-skills/archive/refs/heads/main.tar.gz",
-  "archive_root": "zo-skills-main",
+  "tarball_url": "https://github.com/thevibethinker/ai-wizard-skill/archive/refs/heads/main.tar.gz",
+  "archive_root": "ai-wizard-skill-main",
   "skills": [
     {
       "slug": "agentmail-inbox-firewall",
       "description": "Hardened AgentMail webhook receiver operations for multi-inbox routing, security triage, and service deployment."
+    },
+    {
+      "slug": "ai-wizard",
+      "description": "Generate an observed AI fluency profile from real AI usage traces, workspace artifacts, and Vibe Pill methodology."
     },
     {
       "slug": "booking-metadata-calendar",

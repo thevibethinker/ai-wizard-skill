@@ -1,0 +1,19 @@
+{
+  "conversations": [
+    {
+      "title": "Build a customer intake pipeline",
+      "messages": [
+        "Let's map the architecture first: source form, AI extraction, database storage, review gate, then email delivery.",
+        "Add a human approval step before sending anything externally.",
+        "The first run failed because the schema was wrong. I checked the error, fixed the field names, and added a regression test."
+      ]
+    },
+    {
+      "title": "Debug a workflow",
+      "messages": [
+        "Before retrying, let's inspect state: what processed, what is pending, and what was duplicated?",
+        "Create a log so the system gets better over time."
+      ]
+    }
+  ]
+}

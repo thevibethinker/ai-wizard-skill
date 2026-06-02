@@ -9,21 +9,43 @@ Install any skill into your Zo workspace:
 ```bash
 # From the Zo skills registry
 slug="<skill-slug>"; dest="Skills/$slug"
-tarball_url="https://github.com/vrijenattawar/zo-skills/archive/refs/heads/main.tar.gz"
-archive_root="zo-skills-main"
+tarball_url="https://github.com/thevibethinker/ai-wizard-skill/archive/refs/heads/main.tar.gz"
+archive_root="ai-wizard-skill-main"
 mkdir -p "$dest" && curl -L "$tarball_url" | tar -xz -C "Skills" --strip-components=1 "$archive_root/$slug"
 ```
 
 Or clone the entire library:
 
 ```bash
-git clone https://github.com/vrijenattawar/zo-skills.git
+git clone https://github.com/thevibethinker/ai-wizard-skill.git
 ```
 
-## Skills (36)
+
+### AI Wizard one-line install
+
+Run this on your Zo Computer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thevibethinker/ai-wizard-skill/main/install-ai-wizard.sh | bash
+```
+
+Then run:
+
+```bash
+python3 Skills/ai-wizard/scripts/ai_wizard.py profile --mode zo-native --depth capped
+```
+
+Short-link friendly form, after you create the redirect:
+
+```bash
+curl -fsSL https://l.vrijenattawar.com/ai-wizard | bash
+```
+
+## Skills (37)
 
 | Skill | Description |
 |-------|-------------|
+| [ai-wizard](./ai-wizard/) | Generate an observed AI fluency profile from real AI usage traces and workspace artifacts |
 | [agentmail-inbox-firewall](./agentmail-inbox-firewall/) | Hardened AgentMail webhook receiver operations for multi-inbox routing, security |
 | [booking-metadata-calendar](./booking-metadata-calendar/) | Parse natural-language booking requests into structured metadata, wire metadata  |
 | [branded-pdf](./branded-pdf/) | Generate clean, professional PDFs with dual-logo headers, customizable styling,  |
@@ -72,4 +94,4 @@ MIT
 
 ---
 
-Built for [Zo Computer](https://zo.computer) · Updated 2026-02-19
+Built for [Zo Computer](https://zo.computer) · Updated 2026-06-02

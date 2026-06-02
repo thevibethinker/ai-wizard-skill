@@ -1,0 +1,15 @@
+{
+  "conversations": [
+    {
+      "title": "Create durable intake pipeline",
+      "messages": [
+        "Map the architecture first: source form, parser, validation schema, review queue, database storage, and delivery step.",
+        "Add a human approval gate before any external email is sent.",
+        "Make the workflow portable across Claude, Codex, ChatGPT, and Zo by preserving the pipeline primitives instead of product-specific prompts.",
+        "Create a CLI tool with --help, write a regression fixture, and store every run in a history database.",
+        "When the first run fails, inspect the traceback, form a hypothesis, patch the parser, and re-run only the failing stage.",
+        "After validation passes, write an AAR that captures the error, fix, guardrail, and next improvement."
+      ]
+    }
+  ]
+}

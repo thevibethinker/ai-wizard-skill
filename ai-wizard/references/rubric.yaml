@@ -1,0 +1,31 @@
+---
+diagnostic_instincts:
+  mental_model_accuracy:
+    strong: ["verify", "source", "architecture", "schema", "ground truth"]
+    weak: ["trust output", "are you sure", "hope"]
+  decomposition_instinct:
+    strong: ["plan", "drop", "phase", "scenario", "step", "wave"]
+    weak: ["everything", "one prompt", "all at once"]
+  failure_recognition:
+    strong: ["validate", "test", "audit", "hallucination", "guardrail"]
+    weak: ["accept", "ignore", "reroll"]
+  tool_agnostic_thinking:
+    strong: ["adapter", "portable", "baseline", "cross-compatible", "export"]
+    weak: ["exact prompt", "only in"]
+  delegation_judgment:
+    strong: ["approval", "confirm", "human gate", "draft", "review"]
+    weak: ["send automatically", "publish automatically"]
+  iteration_refinement:
+    strong: ["retry", "refine", "calibrate", "debug", "AAR"]
+    weak: ["keep tweaking", "random"]
+core_primitives:
+  system_composition: ["wire", "connect", "route", "compose", "multi-channel"]
+  pipeline_thinking: ["source", "transform", "store", "deliver", "dedupe", "schema"]
+  tool_thinking: ["CLI", "dashboard", "form", "route", "interface", "button"]
+  integration_thinking: ["API", "OAuth", "webhook", "sync", "export", "import"]
+  orchestration_trust_boundaries: ["approval", "gate", "human-in-the-loop", "dry-run", "external commit"]
+  feedback_loops: ["log", "history", "eval", "metrics", "learn", "improve"]
+meta_primitives:
+  context_engineering: ["context", "persona", "rules", "retrieve", "source selection"]
+  state_awareness: ["state", "status", "checkpoint", "idempotent", "watermark"]
+  error_recovery: ["error", "hypothesis", "fix", "traceback", "debug", "circular"]

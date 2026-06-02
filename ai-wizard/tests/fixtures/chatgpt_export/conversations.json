@@ -1,0 +1,40 @@
+{
+  "mapping": {
+    "node-1": {
+      "message": {
+        "author": {"role": "user"},
+        "create_time": 1778945424.0,
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "I want to build a customer support triage workflow. Start by mapping the pipeline and trust boundaries before writing anything."
+          ]
+        }
+      }
+    },
+    "node-2": {
+      "message": {
+        "author": {"role": "assistant"},
+        "create_time": 1778945488.0,
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "We can use source intake, classification, human approval, delivery, and a feedback log."
+          ]
+        }
+      }
+    },
+    "node-3": {
+      "message": {
+        "author": {"role": "user"},
+        "create_time": 1778945520.0,
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "Add verification: compare classifications against a labeled sample and log failures for error recovery."
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "conversations": [
+    {
+      "title": "Build repeatable research workflow",
+      "messages": [
+        "Let's break this into source discovery, extraction, synthesis, and review.",
+        "Use a small schema for each source and keep the raw links separate from the summary.",
+        "Before sending the final memo, validate the claims against the source pages.",
+        "If the extraction fails, log the error and retry only that source."
+      ]
+    }
+  ]
+}
