@@ -13,6 +13,10 @@
       "description": "Generate an observed AI fluency profile from real AI usage traces, workspace artifacts, and Vibe Pill methodology."
     },
     {
+      "slug": "ai-wizard-interpreter",
+      "description": "Explain an AI Wizard dossier (profile.json) in plain language \u2014 what the score means, exactly how it was computed, what drove it up or down, how confident it is, and what to do next. Use when someone submits their AI Wizard result and wants it interpreted. Read-only; never runs or modifies the ai-wizard skill."
+    },
+    {
       "slug": "booking-metadata-calendar",
       "description": "Parse natural-language booking requests into structured metadata, wire metadata into calendar event payloads, and persist retrievable records keyed by meeting ID."
     },

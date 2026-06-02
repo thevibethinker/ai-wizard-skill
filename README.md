@@ -41,11 +41,12 @@ Short-link friendly form, after you create the redirect:
 curl -fsSL https://l.vrijenattawar.com/ai-wizard | bash
 ```
 
-## Skills (37)
+## Skills (42)
 
 | Skill | Description |
 |-------|-------------|
 | [ai-wizard](./ai-wizard/) | Generate an observed AI fluency profile from real AI usage traces and workspace artifacts |
+| [ai-wizard-interpreter](./ai-wizard-interpreter/) | Explain an AI Wizard dossier in plain language — what the score means, how it was computed, what moved it, and what to do next |
 | [agentmail-inbox-firewall](./agentmail-inbox-firewall/) | Hardened AgentMail webhook receiver operations for multi-inbox routing, security |
 | [booking-metadata-calendar](./booking-metadata-calendar/) | Parse natural-language booking requests into structured metadata, wire metadata  |
 | [branded-pdf](./branded-pdf/) | Generate clean, professional PDFs with dual-logo headers, customizable styling,  |
