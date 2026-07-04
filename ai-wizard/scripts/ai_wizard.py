@@ -1961,6 +1961,88 @@ def command_history(_: argparse.Namespace) -> None:
     ], indent=2))
 
 
+LEADERBOARD_URL = os.environ.get("AI_WIZARD_LEADERBOARD_URL", "https://va.zo.space/api/ai-wizard-rank")
+
+
+def detect_harness() -> str:
+    if os.environ.get("ZO_CLIENT_IDENTITY_TOKEN"):
+        return "zo"
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE"):
+        return "claude_code"
+    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_HOME") or (Path.home() / ".codex").exists():
+        return "codex"
+    if (Path.home() / ".claude").exists():
+        return "claude_code"
+    return "other"
+
+
+def build_submission(profile: dict[str, Any], name: str, harness: str, public: bool) -> dict[str, Any]:
+    score = profile.get("score") or {}
+    return {
+        "name": name,
+        "score": profile.get("raw_score"),
+        "explanation": (score.get("explanation") or {}),
+        "semantic_status": profile.get("semantic_status"),
+        "semantic_mode": profile.get("semantic_mode"),
+        "calibrated_range": profile.get("calibrated_range") or score.get("range"),
+        "run_id": profile.get("run_id"),
+        "generated_at": profile.get("generated_at"),
+        "harness": harness,
+        "stage": (profile.get("maturity_stage") or {}).get("label", ""),
+        "archetype": profile.get("archetype", ""),
+        "confidence": str(profile.get("confidence", "")),
+        "evidence_records": (profile.get("coverage") or {}).get("evidence_records"),
+        "display_public": public,
+    }
+
+
+def command_submit(args: argparse.Namespace) -> None:
+    run_dir = latest_run_dir() if args.latest or not args.run else Path(args.run)
+    profile_path = run_dir / "profile.json"
+    if not profile_path.exists():
+        nested = sorted(run_dir.glob("*/profile.json"), key=lambda p: p.stat().st_mtime)
+        if nested:
+            profile_path = nested[-1]
+            run_dir = profile_path.parent
+        else:
+            raise SystemExit(f"profile.json not found in run directory: {run_dir}")
+    profile = json.loads(profile_path.read_text())
+    if profile.get("profile_status") != "ok":
+        raise SystemExit(f"Refusing to submit a profile with status {profile.get('profile_status')!r}")
+    harness = args.harness or detect_harness()
+    payload = build_submission(profile, name=args.name, harness=harness, public=not args.private)
+    if args.dry_run:
+        print(json.dumps({"url": LEADERBOARD_URL, "payload": payload}, indent=2))
+        return
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        LEADERBOARD_URL,
+        data=body,
+        headers={
+            "content-type": "application/json",
+            "accept": "application/json",
+            "user-agent": "ai-wizard-cli/0.4.0 (+https://github.com/thevibethinker/ai-wizard-skill)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:500]
+        raise SystemExit(f"Submission rejected (HTTP {exc.code}): {detail}")
+    print(json.dumps({
+        "submitted": True,
+        "score": payload["score"],
+        "harness": harness,
+        "integrity": result.get("integrity"),
+        "rank": result.get("rank"),
+        "percentile": result.get("percentile"),
+        "total_public_entries": result.get("total"),
+        "leaderboard": "https://va.zo.space/ai-wizard-rank",
+    }, indent=2))
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="AI Wizard observed AI fluency profiler")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1995,6 +2077,14 @@ def parser() -> argparse.ArgumentParser:
     rep.add_argument("--run", help="Artifact directory containing profile.json")
     rep.add_argument("--latest", action="store_true", help="Report on the latest persisted AI Wizard run")
     rep.set_defaults(func=command_report)
+    sub_submit = sub.add_parser("submit", help="Submit a run's score to the public leaderboard (no keys required)")
+    sub_submit.add_argument("--name", required=True, help="Public display name for the leaderboard")
+    sub_submit.add_argument("--run", help="Artifact directory containing profile.json (default: latest run)")
+    sub_submit.add_argument("--latest", action="store_true", help="Submit the latest persisted run (default when --run omitted)")
+    sub_submit.add_argument("--harness", choices=["zo", "codex", "claude_code", "chatgpt", "other"], help="Override auto-detected harness")
+    sub_submit.add_argument("--private", action="store_true", help="Record the score without showing it on the public board")
+    sub_submit.add_argument("--dry-run", action="store_true", help="Print the payload without submitting")
+    sub_submit.set_defaults(func=command_submit)
     return p
 
 

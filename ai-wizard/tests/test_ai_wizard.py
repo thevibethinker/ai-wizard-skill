@@ -920,3 +920,47 @@ def test_codex_bare_rollout_jsonl_traces(tmp_path):
     assert any("ingest pipeline" in t for t in texts)
     assert any("approval gate" in t for t in texts)
     assert all("you are codex" not in t.lower() for t in texts)
+
+
+def test_submit_dry_run_builds_valid_payload(tmp_path):
+    run_cmd(
+        "profile", "--mode", "baseline", "--input", str(FIXTURE),
+        "--no-semantic", "--skip-history", "--out", str(tmp_path / "run"),
+    )
+    result = run_cmd("submit", "--name", "Test Runner", "--run", str(tmp_path / "run"), "--dry-run")
+    payload = json.loads(result.stdout)["payload"]
+    assert payload["name"] == "Test Runner"
+    assert isinstance(payload["score"], int)
+    assert set(payload["explanation"]) == {"diagnostic_instincts", "vibe_pill_primitives", "meta_primitives"}
+    assert payload["harness"] in {"zo", "codex", "claude_code", "chatgpt", "other"}
+    assert payload["display_public"] is True
+
+
+def test_submit_harness_override_and_private(tmp_path):
+    run_cmd(
+        "profile", "--mode", "baseline", "--input", str(FIXTURE),
+        "--no-semantic", "--skip-history", "--out", str(tmp_path / "run"),
+    )
+    result = run_cmd(
+        "submit", "--name", "Test Runner", "--run", str(tmp_path / "run"),
+        "--harness", "codex", "--private", "--dry-run",
+    )
+    payload = json.loads(result.stdout)["payload"]
+    assert payload["harness"] == "codex"
+    assert payload["display_public"] is False
+
+
+def test_submit_score_matches_server_integrity_band(tmp_path):
+    run_cmd(
+        "profile", "--mode", "baseline", "--input", str(FIXTURE),
+        "--no-semantic", "--skip-history", "--out", str(tmp_path / "run"),
+    )
+    result = run_cmd("submit", "--name", "Band Check", "--run", str(tmp_path / "run"), "--dry-run")
+    payload = json.loads(result.stdout)["payload"]
+    exp = payload["explanation"]
+    base = exp["diagnostic_instincts"] * 0.28 + exp["vibe_pill_primitives"] * 0.47 + exp["meta_primitives"] * 0.25
+    low = base * 720 - 5
+    high = base * 940 + 5
+    if payload["semantic_status"] == "complete":
+        high += 40
+    assert low <= payload["score"] <= high

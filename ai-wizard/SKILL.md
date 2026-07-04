@@ -4,7 +4,7 @@ description: Generate an observed AI fluency profile from real AI usage traces, 
 compatibility: Created for Zo Computer; baseline mode also supports exported Claude/Codex/ChatGPT-style conversation folders.
 metadata:
   author: va.zo.computer
-  version: "0.3.0"
+  version: "0.4.0"
   created: "2026-05-25"
 ---
 
@@ -37,7 +37,18 @@ python3 Skills/ai-wizard/scripts/ai_wizard.py profile --semantic-provider zo --s
 python3 Skills/ai-wizard/scripts/ai_wizard.py profile --semantic-provider anthropic --semantic-resume
 python3 Skills/ai-wizard/scripts/ai_wizard.py report --latest
 python3 Skills/ai-wizard/scripts/ai_wizard.py history
+python3 Skills/ai-wizard/scripts/ai_wizard.py submit --name "Your Name" --latest
 ```
+
+## Leaderboard
+
+`submit` posts your latest profile score to the public leaderboard at https://va.zo.space/ai-wizard-rank — no keys or accounts required.
+
+- The payload includes your three group scores; the server recomputes the public scoring formula and rejects totals that contradict their own groups. Consistent entries get a "consistent" badge; manual web-form entries without group scores are marked self-reported.
+- Harness (zo / claude_code / codex / other) is auto-detected from the environment; override with `--harness`.
+- `--dry-run` prints the exact payload without sending anything. `--private` submits without appearing on the public board. `--run <dir>` submits a specific run instead of the latest.
+- The response reports your rank, percentile, and total entries. The board shows each name's best score.
+- Override the endpoint with `AI_WIZARD_LEADERBOARD_URL`.
 
 ## Defaults
 
