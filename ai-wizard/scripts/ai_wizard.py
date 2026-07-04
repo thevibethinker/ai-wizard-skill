@@ -139,6 +139,7 @@ def default_trace_dirs() -> list[Path]:
         return [Path(p).expanduser() for p in env.split(":") if p.strip()]
     candidates = [
         Path.home() / ".claude/projects",
+        Path.home() / ".codex/sessions",
         DEFAULT_WORKSPACE / "N5/logs/threads",
     ]
     return [c for c in candidates if c.exists()]
@@ -392,6 +393,12 @@ def structured_jsonl_evidence(text: str, source: str, path: Path, start_idx: int
         if event_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
             message = extract_content_text(payload.get("content"))
             user_text = extract_real_user_message(message)
+            if user_text:
+                chunks.append((user_text, timestamp))
+            continue
+        # Codex bare rollout format: response items at top level, no payload wrapper
+        if event_type == "message" and data.get("role") == "user":
+            user_text = extract_real_user_message(extract_content_text(data.get("content")))
             if user_text:
                 chunks.append((user_text, timestamp))
             continue
@@ -694,14 +701,15 @@ def semantic_status(requested: bool, provider: str = "auto") -> dict[str, Any]:
             "events": [{"type": "not_requested", "provider": provider, "message": "Semantic pass disabled by --no-semantic."}],
             "note": "Semantic pass disabled by --no-semantic; scores are deterministic keyword heuristics.",
         }
-    if provider == "zo":
+    if provider in ("zo", "anthropic"):
+        label = "zo_ask" if provider == "zo" else "anthropic"
         return {
             "requested": True,
-            "provider": "zo_ask",
-            "mode": "semantic-zo",
+            "provider": label,
+            "mode": f"semantic-{provider}",
             "status": "partial",
-            "events": [{"type": "provider_requested", "provider": "zo_ask"}],
-            "note": "Zo semantic provider requested; profile will report complete only after provider adjudication succeeds.",
+            "events": [{"type": "provider_requested", "provider": label}],
+            "note": f"{provider} semantic provider requested; profile will report complete only after provider adjudication succeeds.",
         }
     return {
         "requested": provider != "heuristic",
@@ -724,6 +732,12 @@ def validate_semantic_provider(args: argparse.Namespace) -> tuple[bool, dict[str
             raise SystemExit("--semantic-provider zo requires ZO_CLIENT_IDENTITY_TOKEN")
         status = semantic_status(True, "zo")
         return True, status, "zo_semantic_adjudication_v0", "Zo-backed semantic adjudication reviewed sampled evidence and adjusted axis confidence. Treat scores as directional until broader calibration lands."
+    if provider == "anthropic":
+        has_mock = os.environ.get("AI_WIZARD_ANTHROPIC_MOCK_RESPONSES") is not None or os.environ.get("AI_WIZARD_ANTHROPIC_MOCK_RESPONSE") is not None
+        if not os.environ.get("ANTHROPIC_API_KEY") and not has_mock:
+            raise SystemExit("--semantic-provider anthropic requires ANTHROPIC_API_KEY")
+        status = semantic_status(True, "anthropic")
+        return True, status, "anthropic_semantic_adjudication_v0", "Anthropic-backed semantic adjudication reviewed sampled evidence and adjusted axis confidence. Treat scores as directional until broader calibration lands."
     status = semantic_status(True, "heuristic")
     return False, status, "deterministic_keyword_heuristic_v0", "Semantic provider was not requested; deterministic keyword heuristics only."
 
@@ -821,9 +835,59 @@ def call_zo_ask(prompt: str, timeout_seconds: float = 90) -> str:
     raise RuntimeError("Zo ask response missing output")
 
 
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
+
+
+def call_anthropic(prompt: str, timeout_seconds: float = 90) -> str:
+    mock_sequence = os.environ.get("AI_WIZARD_ANTHROPIC_MOCK_RESPONSES")
+    if mock_sequence is not None:
+        values = json.loads(mock_sequence)
+        if not isinstance(values, list) or not values:
+            raise RuntimeError("AI_WIZARD_ANTHROPIC_MOCK_RESPONSES must be a non-empty JSON list")
+        index = int(getattr(call_anthropic, "_mock_index", 0))
+        setattr(call_anthropic, "_mock_index", index + 1)
+        value = values[min(index, len(values) - 1)]
+        if isinstance(value, dict) and value.get("raise"):
+            raise RuntimeError(str(value["raise"]))
+        return json.dumps(value) if isinstance(value, dict) else str(value)
+    mock = os.environ.get("AI_WIZARD_ANTHROPIC_MOCK_RESPONSE")
+    if mock is not None:
+        return mock
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("missing ANTHROPIC_API_KEY")
+    body = json.dumps({
+        "model": os.environ.get("AI_WIZARD_ANTHROPIC_MODEL", ANTHROPIC_DEFAULT_MODEL),
+        "max_tokens": 8192,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        ANTHROPIC_API_URL,
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        payload = json.loads(resp.read())
+    parts = [block.get("text", "") for block in payload.get("content", []) if isinstance(block, dict) and block.get("type") == "text"]
+    text = "".join(parts).strip()
+    if not text:
+        raise RuntimeError("Anthropic response missing text content")
+    return text
+
+
+SEMANTIC_PROVIDER_CALLS = {"zo": call_zo_ask, "anthropic": call_anthropic}
+SEMANTIC_PROVIDER_LABELS = {"zo": "zo_ask", "anthropic": "anthropic"}
+
+
 def semantic_prompt(packets: list[dict[str, Any]]) -> str:
     return (
-        "You are the Zo-backed semantic adjudicator for AI Wizard, an observed AI fluency profile.\n"
+        "You are the semantic adjudicator for AI Wizard, an observed AI fluency profile.\n"
         "Review compact evidence packets. Do not infer private facts beyond the packet. "
         "Return strict JSON only, no markdown.\n\n"
         "Allowed axes: "
@@ -907,7 +971,10 @@ def run_zo_semantic_reviews_resumable(
     retries: int = 1,
     timeout_seconds: float = 90,
     backoff_seconds: float = 0.25,
+    provider: str = "zo",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    call_provider = SEMANTIC_PROVIDER_CALLS[provider]
+    provider_label = SEMANTIC_PROVIDER_LABELS[provider]
     packets = evidence_packets(evidence, cap)
     reviews: list[dict[str, Any]] = load_checkpoint_reviews(checkpoint_path, evidence) if checkpoint_path and resume else []
     reviewed_ids = {review["evidence_id"] for review in reviews}
@@ -926,9 +993,9 @@ def run_zo_semantic_reviews_resumable(
         batch_no = idx // batch_size + 1
         batch_reviews: list[dict[str, Any]] = []
         for attempt in range(retries + 1):
-            events.append({"type": "provider_attempt", "provider": "zo_ask", "batch": batch_no, "attempt": attempt + 1, "items": len(batch)})
+            events.append({"type": "provider_attempt", "provider": provider_label, "batch": batch_no, "attempt": attempt + 1, "items": len(batch)})
             try:
-                payload = parse_json_object(call_zo_ask(semantic_prompt(batch), timeout_seconds=timeout_seconds))
+                payload = parse_json_object(call_provider(semantic_prompt(batch), timeout_seconds=timeout_seconds))
                 known_ids = {p["evidence_id"] for p in batch}
                 raw_reviews = payload.get("evidence_reviews") or []
                 if not isinstance(raw_reviews, list):
@@ -940,16 +1007,16 @@ def run_zo_semantic_reviews_resumable(
                             batch_reviews.append(review)
                             reviewed_ids.add(review["evidence_id"])
                 reviews.extend(batch_reviews)
-                events.append({"type": "batch_complete", "provider": "zo_ask", "batch": batch_no, "items_reviewed": len(batch_reviews)})
+                events.append({"type": "batch_complete", "provider": provider_label, "batch": batch_no, "items_reviewed": len(batch_reviews)})
                 if checkpoint_path:
                     append_checkpoint_reviews(checkpoint_path, batch_reviews)
                     events.append({"type": "checkpoint_written", "batch": batch_no, "path": str(checkpoint_path), "items_written": len(batch_reviews)})
                 break
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
-                events.append({"type": "provider_error", "provider": "zo_ask", "batch": batch_no, "attempt": attempt + 1, "error": error})
+                events.append({"type": "provider_error", "provider": provider_label, "batch": batch_no, "attempt": attempt + 1, "error": error})
                 if attempt < retries:
-                    events.append({"type": "retry_scheduled", "provider": "zo_ask", "batch": batch_no, "attempt": attempt + 2, "backoff_seconds": backoff_seconds})
+                    events.append({"type": "retry_scheduled", "provider": provider_label, "batch": batch_no, "attempt": attempt + 2, "backoff_seconds": backoff_seconds})
                     if backoff_seconds > 0:
                         import time
                         time.sleep(backoff_seconds)
@@ -958,9 +1025,9 @@ def run_zo_semantic_reviews_resumable(
                     events.append({"type": "fallback_to_heuristic", "batch": batch_no, "reason": error})
     status = "complete" if packets and not failures and len(reviews) == len(packets) else "partial" if reviews else "failed"
     return reviews, {
-        "provider": "zo_ask",
+        "provider": provider_label,
         "status": status,
-        "mode": "semantic-zo",
+        "mode": f"semantic-{provider}",
         "items_sampled": len(packets),
         "items_reviewed": len(reviews),
         "items_reused": len([review for review in reviews if review["evidence_id"] not in {packet["evidence_id"] for packet in missing_packets}]),
@@ -1677,7 +1744,7 @@ def make_profile(args: argparse.Namespace, artifact_dir: Path | None = None) -> 
         semantic_payload.update(review_status)
         methodology_warning = "Semantic scores replay saved adjudication reviews; no new semantic provider call was made."
         analysis_method = "semantic_review_replay_v0"
-    elif semantic and provider == "zo" and evidence:
+    elif semantic and provider in ("zo", "anthropic") and evidence:
         review_cap = args.semantic_cap if args.depth == "capped" else len(evidence)
         checkpoint = artifact_dir / "semantic-reviews.jsonl" if artifact_dir else None
         semantic_reviews, review_status = run_zo_semantic_reviews_resumable(
@@ -1688,15 +1755,16 @@ def make_profile(args: argparse.Namespace, artifact_dir: Path | None = None) -> 
             retries=getattr(args, "semantic_retries", 1),
             timeout_seconds=getattr(args, "semantic_timeout", 90),
             backoff_seconds=getattr(args, "semantic_backoff", 0.25),
+            provider=provider,
         )
         semantic_payload.update(review_status)
         if review_status["status"] == "complete":
-            semantic_payload["note"] = "Zo semantic provider completed evidence adjudication and wrote replayable reviews."
+            semantic_payload["note"] = f"{provider} semantic provider completed evidence adjudication and wrote replayable reviews."
         elif review_status["status"] == "partial":
-            semantic_payload["note"] = "Zo semantic provider partially completed; unreviewed evidence used deterministic fallback."
+            semantic_payload["note"] = f"{provider} semantic provider partially completed; unreviewed evidence used deterministic fallback."
         else:
-            semantic_payload["note"] = "Zo semantic provider failed; deterministic fallback used for scoring."
-    semantic_complete = semantic_payload.get("mode") == "semantic-zo" and semantic_payload.get("status") == "complete"
+            semantic_payload["note"] = f"{provider} semantic provider failed; deterministic fallback used for scoring."
+    semantic_complete = semantic_payload.get("mode") in ("semantic-zo", "semantic-anthropic") and semantic_payload.get("status") == "complete"
     axes = analyze_axes(evidence, semantic=semantic_complete, reviews=semantic_reviews)
     reference_records = min(args.semantic_cap, 24) if args.depth == "capped" else 250
     coverage = min(1.0, len(evidence) / max(1, reference_records))
@@ -1766,7 +1834,7 @@ def command_profile(args: argparse.Namespace) -> None:
     artifact_dir = out_root / provisional_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
     profile, inventory = make_profile(args, artifact_dir=artifact_dir)
-    final_dir = artifact_dir if args.semantic_provider == "zo" else out_root / profile["run_id"]
+    final_dir = artifact_dir if args.semantic_provider in ("zo", "anthropic") else out_root / profile["run_id"]
     if final_dir != artifact_dir:
         if final_dir.exists():
             artifact_dir = final_dir
@@ -1909,7 +1977,7 @@ def parser() -> argparse.ArgumentParser:
     prof.add_argument("--sources", default="workspace,conversations,git", help="Comma-separated zo-native evidence sources: workspace, conversations, git.")
     prof.add_argument("--trace-dir", action="append", help="Extra conversation-trace directory (repeatable); overrides auto-detected trace dirs.")
     prof.add_argument("--max-scan-files", type=int, default=250, help="Maximum export files to inspect before stopping; bounds large Claude/Codex histories.")
-    prof.add_argument("--semantic-provider", choices=["auto", "heuristic", "zo"], default="auto", help="Semantic provider contract. auto currently uses heuristic fallback unless upgraded.")
+    prof.add_argument("--semantic-provider", choices=["auto", "heuristic", "zo", "anthropic"], default="auto", help="Semantic provider contract. zo uses /zo/ask (Zo Computer), anthropic uses the Anthropic Messages API via ANTHROPIC_API_KEY. auto uses heuristic fallback.")
     prof.add_argument("--semantic-reviews", help="Replay a saved semantic-reviews.jsonl file instead of calling a semantic provider.")
     prof.add_argument("--semantic-resume", action="store_true", help="Reuse semantic-reviews.jsonl in the target run directory and only request missing Zo reviews.")
     prof.add_argument("--semantic-retries", type=int, default=1, help="Retry count for each Zo semantic batch before falling back to heuristic scoring.")

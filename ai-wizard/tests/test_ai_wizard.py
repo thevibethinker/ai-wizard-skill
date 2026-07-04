@@ -850,3 +850,73 @@ def test_sources_flag_workspace_only(tmp_path):
     artifact_dir = Path(json.loads(result.stdout)["artifact_dir"])
     profile = json.loads((artifact_dir / "profile.json").read_text())
     assert all(item["source"] == "workspace" for item in profile["evidence_dossier"])
+
+
+def test_anthropic_semantic_provider_requires_key(tmp_path):
+    env = {**os.environ, "AI_WIZARD_ZO_ASK_MOCK_RESPONSE": ""}
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("AI_WIZARD_ANTHROPIC_MOCK_RESPONSE", None)
+    env.pop("AI_WIZARD_ANTHROPIC_MOCK_RESPONSES", None)
+    result = subprocess.run(
+        ["python3", str(SCRIPT), "profile", "--mode", "baseline", "--input", str(FIXTURE),
+         "--semantic-provider", "anthropic", "--skip-history", "--out", str(tmp_path)],
+        text=True, capture_output=True, env=env, check=False,
+    )
+    assert result.returncode != 0
+    assert "ANTHROPIC_API_KEY" in result.stderr or "ANTHROPIC_API_KEY" in result.stdout
+
+
+def test_anthropic_semantic_provider_writes_replayable_reviews(tmp_path):
+    response = {
+        "evidence_reviews": [
+            {
+                "evidence_id": "baseline-0000",
+                "quality": "strong",
+                "axis_scores": {"pipeline_thinking": 0.9, "feedback_loops": 0.8},
+                "supported_claims": ["Shows a pipeline with validation."],
+                "risk_flags": [],
+                "level_up_hint": "Add a human gate.",
+            }
+        ],
+        "batch_quality_notes": "test fixture",
+    }
+    result = run_cmd(
+        "profile", "--mode", "baseline", "--input", str(FIXTURE),
+        "--semantic-provider", "anthropic", "--semantic-cap", "1",
+        "--skip-history", "--out", str(tmp_path),
+        env={"AI_WIZARD_ANTHROPIC_MOCK_RESPONSE": json.dumps(response)},
+    )
+    artifact_dir = Path(json.loads(result.stdout)["artifact_dir"])
+    profile = json.loads((artifact_dir / "profile.json").read_text())
+    assert profile["semantic"]["provider"] == "anthropic"
+    assert profile["semantic"]["status"] == "complete"
+    assert profile["semantic_mode"] == "semantic-anthropic"
+    assert profile["semantic_status"] == "complete"
+    assert profile["semantic"]["items_reviewed"] == 1
+    assert (artifact_dir / "semantic-reviews.jsonl").exists()
+    assert profile["analysis_method"] == "anthropic_semantic_adjudication_v0"
+    assert profile["axes"]["vibe_pill_primitives"]["pipeline_thinking"]["score"] > 0
+
+
+def test_codex_bare_rollout_jsonl_traces(tmp_path):
+    trace_dir = tmp_path / "codex-sessions"
+    trace_dir.mkdir()
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {"id": "s1"}, "timestamp": "2026-07-01T00:00:00Z"}),
+        json.dumps({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "You are Codex, based on GPT-5."}], "timestamp": "2026-07-01T00:00:01Z"}),
+        json.dumps({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Refactor the ingest pipeline and add schema validation with retries."}], "timestamp": "2026-07-01T00:00:02Z"}),
+        json.dumps({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}], "timestamp": "2026-07-01T00:00:03Z"}),
+        json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Now orchestrate the deploy with an approval gate."}]}, "timestamp": "2026-07-01T00:00:04Z"}),
+    ]
+    (trace_dir / "rollout-2026-07-01.jsonl").write_text("\n".join(lines))
+    import sys
+    sys.path.insert(0, str(SCRIPT.parent))
+    import importlib
+    import ai_wizard
+    importlib.reload(ai_wizard)
+    items = ai_wizard.collect_conversation_traces(limit=20, trace_dirs=[trace_dir])
+    texts = [item.text for item in items]
+    assert len(items) == 2
+    assert any("ingest pipeline" in t for t in texts)
+    assert any("approval gate" in t for t in texts)
+    assert all("you are codex" not in t.lower() for t in texts)
