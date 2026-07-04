@@ -18,7 +18,7 @@ from time import perf_counter
 
 DEFAULT_WORKSPACE = Path(os.environ.get("AI_WIZARD_WORKSPACE", "/home/workspace")).resolve()
 ZO_ASK_URL = "https://api.zo.computer/zo/ask"
-ZO_MODEL = os.environ.get("AI_WIZARD_ZO_MODEL", "byok:8a1176d8-10bf-44e8-a25c-30329932843c")
+ZO_MODEL = os.environ.get("AI_WIZARD_ZO_MODEL", "")
 QUALITY_MULTIPLIERS = {
     "noise": 0.0,
     "weak": 0.5,
@@ -111,17 +111,156 @@ def score_keywords(text: str, keywords: list[str]) -> int:
     return sum(1 for kw in keywords if kw.lower() in lower)
 
 
-def collect_workspace_artifacts(limit: int = 250) -> list[Evidence]:
-    candidates: list[Path] = []
-    for base in [DEFAULT_WORKSPACE / "N5/builds", DEFAULT_WORKSPACE / "Skills", DEFAULT_WORKSPACE / "Prompts"]:
+def default_workspace_roots() -> list[Path]:
+    env_roots = os.environ.get("AI_WIZARD_ROOTS")
+    if env_roots:
+        roots = []
+        for part in env_roots.split(":"):
+            part = part.strip()
+            if not part:
+                continue
+            candidate = Path(part).expanduser()
+            if not candidate.is_absolute():
+                candidate = DEFAULT_WORKSPACE / part
+            roots.append(candidate)
+        return roots
+    candidates = [
+        DEFAULT_WORKSPACE / "N5/builds",
+        DEFAULT_WORKSPACE / "Skills",
+        DEFAULT_WORKSPACE / "Prompts",
+    ]
+    existing = [c for c in candidates if c.exists()]
+    return existing or [DEFAULT_WORKSPACE]
+
+
+def default_trace_dirs() -> list[Path]:
+    env = os.environ.get("AI_WIZARD_TRACE_DIRS")
+    if env is not None:
+        return [Path(p).expanduser() for p in env.split(":") if p.strip()]
+    candidates = [
+        Path.home() / ".claude/projects",
+        DEFAULT_WORKSPACE / "N5/logs/threads",
+    ]
+    return [c for c in candidates if c.exists()]
+
+
+def collect_conversation_traces(limit: int = 100, trace_dirs: list[Path] | None = None, per_file_cap: int = 12) -> list[Evidence]:
+    dirs = trace_dirs if trace_dirs is not None else default_trace_dirs()
+    evidence: list[Evidence] = []
+    seen_texts: set[str] = set()
+    for base in dirs:
+        if len(evidence) >= limit:
+            break
+        candidates: list[tuple[float, str, Path]] = []
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            if "/artifacts/" in str(path):
+                continue
+            if path.suffix.lower() == ".jsonl" or (base.name == "threads" and path.suffix.lower() == ".md"):
+                try:
+                    candidates.append((path.stat().st_mtime, str(path), path))
+                except OSError:
+                    continue
+        candidates.sort(reverse=True)
+        for _, _, path in candidates:
+            if len(evidence) >= limit:
+                break
+            if path.suffix.lower() == ".jsonl":
+                text = safe_read(path, 2_000_000)
+                items = structured_jsonl_evidence(
+                    text, "conversation", path,
+                    start_idx=len(evidence),
+                    limit=min(per_file_cap, limit - len(evidence)),
+                )
+            else:
+                text = safe_read(path, 8000)
+                signals = detect_signals(text)
+                items = [Evidence(
+                    id=f"conversation-{len(evidence):04d}",
+                    source="conversation",
+                    kind="thread_export",
+                    path=rel(path),
+                    timestamp=None,
+                    text=summarize_text(text, path.name),
+                    signals=signals,
+                    confidence=0.6 if signals else 0.3,
+                )]
+            for item in items:
+                lowered = item.text.lower()
+                if "ai-wizard" in lowered or "ai wizard" in lowered:
+                    continue
+                key = item.text[:400]
+                if key in seen_texts:
+                    continue
+                seen_texts.add(key)
+                item.id = f"conversation-{len(evidence):04d}"
+                evidence.append(item)
+                if len(evidence) >= limit:
+                    break
+    return evidence
+
+
+def collect_git_history(limit: int = 50, repo: Path | None = None) -> list[Evidence]:
+    import subprocess
+    repo = repo or DEFAULT_WORKSPACE
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "log", "--no-merges", f"--max-count={limit}",
+             "--pretty=format:%H%x1f%aI%x1f%s%x1f%b%x1e"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return []
+    if out.returncode != 0:
+        return []
+    evidence: list[Evidence] = []
+    for record in out.stdout.split("\x1e"):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split("\x1f")
+        if len(parts) < 3:
+            continue
+        sha, timestamp, subject = parts[0], parts[1], parts[2]
+        body = parts[3].strip() if len(parts) > 3 else ""
+        text = subject if not body else f"{subject}\n{body}"
+        signals = detect_signals(text)
+        evidence.append(Evidence(
+            id=f"git-{len(evidence):04d}",
+            source="git",
+            kind="commit",
+            path=f"git:{sha[:10]}",
+            timestamp=timestamp,
+            text=summarize_text(text, sha[:10]),
+            signals=signals,
+            confidence=0.6 if signals else 0.3,
+        ))
+    return evidence
+
+
+def collect_workspace_artifacts(limit: int = 250, roots: list[Path] | None = None) -> list[Evidence]:
+    # Round-robin across source roots so one large root (e.g. N5/builds)
+    # cannot exhaust the limit and starve the others.
+    per_base: list[list[Path]] = []
+    for base in (roots if roots is not None else default_workspace_roots()):
         if not base.exists():
             continue
+        found: list[Path] = []
         for path in sorted(base.rglob("*")):
-            if len(candidates) >= limit:
+            if len(found) >= limit:
                 break
             if path.is_file() and path.suffix.lower() in {".md", ".py", ".json", ".yaml", ".yml", ".tsx", ".ts"}:
                 if not is_self_artifact(path):
-                    candidates.append(path)
+                    found.append(path)
+        per_base.append(found)
+    candidates: list[Path] = []
+    depth_idx = 0
+    while len(candidates) < limit and any(depth_idx < len(f) for f in per_base):
+        for found in per_base:
+            if depth_idx < len(found) and len(candidates) < limit:
+                candidates.append(found[depth_idx])
+        depth_idx += 1
     evidence: list[Evidence] = []
     for idx, path in enumerate(candidates):
         text = safe_read(path, 6000)
@@ -255,6 +394,25 @@ def structured_jsonl_evidence(text: str, source: str, path: Path, start_idx: int
             user_text = extract_real_user_message(message)
             if user_text:
                 chunks.append((user_text, timestamp))
+            continue
+        # Claude Code session format: {"type":"user","message":{"role":"user","content":...}}
+        if event_type == "user" and isinstance(data.get("message"), dict):
+            if data.get("isMeta") or data.get("isSidechain"):
+                continue
+            message_obj = data["message"]
+            if message_obj.get("role") != "user":
+                continue
+            content = message_obj.get("content")
+            if isinstance(content, list):
+                content = [
+                    block for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                if not content:
+                    continue
+            user_text = extract_real_user_message(extract_content_text(content))
+            if user_text:
+                chunks.append((user_text, timestamp))
     evidence: list[Evidence] = []
     for offset, (chunk, timestamp) in enumerate(chunks[:limit]):
         signals = detect_signals(chunk)
@@ -283,9 +441,16 @@ def extract_real_user_message(text: str) -> str:
     if "MENTIONED FILES:" in stripped:
         stripped = stripped.split("MENTIONED FILES:", 1)[0].strip()
     stripped = re.sub(r"<system-reminder>.*?</system-reminder>", " ", stripped, flags=re.DOTALL)
+    if stripped.lstrip().startswith(("<task-notification>", "<task_notification>")):
+        return ""
+    stripped = re.sub(r"<local-command-caveat>.*?</local-command-caveat>", " ", stripped, flags=re.DOTALL)
+    stripped = re.sub(r"<local-command-stdout>.*?</local-command-stdout>", " ", stripped, flags=re.DOTALL)
+    stripped = re.sub(r"<command-(?:name|message|args)>.*?</command-(?:name|message|args)>", " ", stripped, flags=re.DOTALL)
     stripped = re.sub(r"\s+", " ", stripped).strip()
     lower = stripped[:2000].lower()
     injected_prefixes = (
+        "[request interrupted by user",
+        "this session is being continued from a previous conversation",
         "you are operating on a system called zo.",
         "you are running on the user's zo computer",
         "# agents.md instructions",
@@ -395,6 +560,38 @@ def detect_signals(text: str) -> list[str]:
     return sorted(set(found))
 
 
+def evidence_source_type(item: Evidence) -> str:
+    if item.kind == "operator_message":
+        return "conversation_trace"
+    if item.kind == "artifact":
+        return "workspace_artifact"
+    return item.kind or item.source
+
+
+def evidence_root(path_text: str, input_path: Path | None = None) -> str:
+    clean = path_text.split("#", 1)[0]
+    path = Path(clean)
+    if input_path:
+        try:
+            return str(path.resolve().relative_to(input_path.resolve())).split(os.sep)[0] or input_path.name
+        except Exception:
+            input_path = None
+    if not path.is_absolute():
+        parts = path.parts
+        return parts[0] if parts else "unknown"
+    try:
+        return str(path.resolve().relative_to(DEFAULT_WORKSPACE)).split(os.sep)[0] or DEFAULT_WORKSPACE.name
+    except Exception:
+        return path.name or str(path.parent) or "unknown"
+
+
+def compact_counts(counts: dict[str, int], limit: int = 8) -> list[dict[str, Any]]:
+    return [
+        {"name": name, "count": count}
+        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    ]
+
+
 def source_inventory(mode: str, input_path: Path | None) -> dict[str, Any]:
     sources = []
     sources.append({
@@ -426,13 +623,16 @@ def build_inventory(mode: str, input_path: Path | None, evidence: list[Evidence]
     base = source_inventory(mode, input_path)
     source_counts: dict[str, int] = {}
     kind_counts: dict[str, int] = {}
-    signal_counts: dict[str, int] = {}
+    source_type_counts: dict[str, int] = {}
     root_counts: dict[str, int] = {}
+    signal_counts: dict[str, int] = {}
     top_paths: list[str] = []
     for item in evidence:
         source_counts[item.source] = source_counts.get(item.source, 0) + 1
         kind_counts[item.kind] = kind_counts.get(item.kind, 0) + 1
-        root = evidence_root(item.path)
+        source_type = evidence_source_type(item)
+        source_type_counts[source_type] = source_type_counts.get(source_type, 0) + 1
+        root = evidence_root(item.path, input_path)
         root_counts[root] = root_counts.get(root, 0) + 1
         for signal in item.signals:
             signal_counts[signal] = signal_counts.get(signal, 0) + 1
@@ -447,80 +647,68 @@ def build_inventory(mode: str, input_path: Path | None, evidence: list[Evidence]
         warnings.append("Workspace-only evidence; direct conversation/export traces may change the profile.")
     if kind_counts.get("artifact", 0) > max(4, kind_counts.get("operator_message", 0) * 4):
         warnings.append("Artifact-heavy evidence; operator-message behavior may be underrepresented.")
-    if root_counts:
-        dominant_root, dominant_count = max(root_counts.items(), key=lambda item: item[1])
-        if dominant_count / max(1, len(evidence)) >= 0.65 and len(evidence) >= 3:
-            warnings.append(f"Source coverage is skewed toward `{dominant_root}`; score may undercount broader live AI usage.")
-    if semantic_payload.get("requested") and semantic_payload.get("status") not in {"completed", "disabled"}:
+    if evidence and root_counts and max(root_counts.values()) / len(evidence) >= 0.7:
+        top_root = max(root_counts.items(), key=lambda item: item[1])[0]
+        warnings.append(f"Source coverage is concentrated in `{top_root}`; score may overfit that root.")
+    if semantic_payload.get("requested") and semantic_payload.get("status") not in {"complete", "not_requested"}:
         warnings.append("Semantic adjudication did not fully complete; deterministic evidence scoring remains material.")
     missing: list[str] = []
     if "operator_message" not in kind_counts:
         missing.append("direct AI conversation/operator-message traces")
     if "baseline" not in source_counts and mode == "zo-native":
         missing.append("portable baseline exports from Claude/Codex/ChatGPT-style histories")
+    if not evidence:
+        missing.append("usable artifacts or conversation traces")
+    unavailable = [
+        source["source"]
+        for source in base["sources"]
+        if not source.get("available") and (mode == "zo-native" or source["source"] == "chatgpt_export")
+    ]
     return base | {
+        "total_evidence_items_scanned": len(evidence),
+        "included_source_types": sorted(source_type_counts),
+        "skipped_or_unavailable_source_types": missing,
+        "top_roots": compact_counts(root_counts),
         "used": {
             "evidence_records": len(evidence),
-            "total_evidence_items_scanned": len(evidence),
-            "included_source_types": sorted(source_counts),
-            "included_evidence_kinds": sorted(kind_counts),
             "source_counts": source_counts,
             "kind_counts": kind_counts,
-            "root_counts": dict(sorted(root_counts.items(), key=lambda item: item[1], reverse=True)),
-            "top_roots": [
-                {"root": root, "count": count}
-                for root, count in sorted(root_counts.items(), key=lambda item: item[1], reverse=True)[:8]
-            ],
+            "source_type_counts": source_type_counts,
+            "root_counts": root_counts,
             "signal_counts": dict(sorted(signal_counts.items(), key=lambda item: item[1], reverse=True)),
             "top_paths": top_paths,
         },
-        "skipped_or_unavailable_source_types": [
-            source["source"]
-            for source in base["sources"]
-            if not source.get("available") or (mode == "baseline" and source["source"] == "zo_workspace")
-        ],
+        "unavailable_sources": unavailable,
         "skew_warnings": warnings,
         "suggested_next_evidence": missing,
     }
-
-
-def evidence_root(path: str) -> str:
-    cleaned = path.split("#", 1)[0]
-    try:
-        p = Path(cleaned)
-    except Exception:
-        return cleaned or "unknown"
-    if p.is_absolute():
-        try:
-            return str(p.relative_to(DEFAULT_WORKSPACE)).split("/", 2)[0] or str(p)
-        except ValueError:
-            parts = p.parts
-            return "/".join(parts[:4]) if len(parts) >= 4 else str(p)
-    parts = cleaned.split("/")
-    if len(parts) >= 3 and parts[0] in {"N5", "Skills", "Prompts", "Documents", "Projects", "Personal"}:
-        return "/".join(parts[:3 if parts[0] == "N5" and parts[1] == "builds" else 2])
-    return parts[0] if parts and parts[0] else "unknown"
 
 
 def semantic_status(requested: bool, provider: str = "auto") -> dict[str, Any]:
     if not requested:
         return {
             "requested": False,
-            "provider": "none",
-            "status": "disabled",
+            "provider": "heuristic",
+            "mode": "heuristic",
+            "status": "not_requested",
+            "events": [{"type": "not_requested", "provider": provider, "message": "Semantic pass disabled by --no-semantic."}],
             "note": "Semantic pass disabled by --no-semantic; scores are deterministic keyword heuristics.",
         }
     if provider == "zo":
         return {
             "requested": True,
             "provider": "zo_ask",
-            "status": "ready",
-            "note": "Zo semantic provider requested. This build validates token availability but still uses deterministic axis aggregation until semantic adjudication is implemented.",
+            "mode": "semantic-zo",
+            "status": "partial",
+            "events": [{"type": "provider_requested", "provider": "zo_ask"}],
+            "note": "Zo semantic provider requested; profile will report complete only after provider adjudication succeeds.",
         }
     return {
-        "requested": True,
+        "requested": provider != "heuristic",
         "provider": "heuristic_fallback",
-        "status": "fallback",
+        "mode": "heuristic",
+        "status": "not_requested",
+        "events": [{"type": "heuristic_mode", "provider": provider, "message": "No external semantic provider requested."}],
         "note": "Semantic provider is heuristic fallback; this is not an LLM-backed adjudication pass.",
     }
 
@@ -537,7 +725,7 @@ def validate_semantic_provider(args: argparse.Namespace) -> tuple[bool, dict[str
         status = semantic_status(True, "zo")
         return True, status, "zo_semantic_adjudication_v0", "Zo-backed semantic adjudication reviewed sampled evidence and adjusted axis confidence. Treat scores as directional until broader calibration lands."
     status = semantic_status(True, "heuristic")
-    return True, status, "semantic_proxy_heuristic_v0", "Semantic scoring is currently a deterministic proxy, not an LLM-backed adjudication pass. Treat the score as directional until semantic calibration is upgraded."
+    return False, status, "deterministic_keyword_heuristic_v0", "Semantic provider was not requested; deterministic keyword heuristics only."
 
 
 def quality_multiplier(quality: str) -> float:
@@ -582,7 +770,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
     except json.JSONDecodeError:
-        pass
+        value = None
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         value = json.loads(match.group(0))
@@ -591,14 +779,28 @@ def parse_json_object(text: str) -> dict[str, Any]:
     raise ValueError("semantic response was not a JSON object")
 
 
-def call_zo_ask(prompt: str) -> str:
+def call_zo_ask(prompt: str, timeout_seconds: float = 90) -> str:
+    mock_sequence = os.environ.get("AI_WIZARD_ZO_ASK_MOCK_RESPONSES")
+    if mock_sequence is not None:
+        values = json.loads(mock_sequence)
+        if not isinstance(values, list) or not values:
+            raise RuntimeError("AI_WIZARD_ZO_ASK_MOCK_RESPONSES must be a non-empty JSON list")
+        index = int(getattr(call_zo_ask, "_mock_index", 0))
+        setattr(call_zo_ask, "_mock_index", index + 1)
+        value = values[min(index, len(values) - 1)]
+        if isinstance(value, dict) and value.get("raise"):
+            raise RuntimeError(str(value["raise"]))
+        return json.dumps(value) if isinstance(value, dict) else str(value)
     mock = os.environ.get("AI_WIZARD_ZO_ASK_MOCK_RESPONSE")
     if mock is not None:
         return mock
     token = os.environ.get("ZO_CLIENT_IDENTITY_TOKEN")
     if not token:
         raise RuntimeError("missing ZO_CLIENT_IDENTITY_TOKEN")
-    body = json.dumps({"input": prompt, "model_name": ZO_MODEL}).encode("utf-8")
+    payload_body: dict[str, Any] = {"input": prompt}
+    if ZO_MODEL:
+        payload_body["model_name"] = ZO_MODEL
+    body = json.dumps(payload_body).encode("utf-8")
     req = urllib.request.Request(
         ZO_ASK_URL,
         data=body,
@@ -609,7 +811,7 @@ def call_zo_ask(prompt: str) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=90) as resp:
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
         payload = json.loads(resp.read())
     output = payload.get("output")
     if isinstance(output, dict):
@@ -702,40 +904,68 @@ def run_zo_semantic_reviews_resumable(
     batch_size: int = 8,
     checkpoint_path: Path | None = None,
     resume: bool = False,
+    retries: int = 1,
+    timeout_seconds: float = 90,
+    backoff_seconds: float = 0.25,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     packets = evidence_packets(evidence, cap)
     reviews: list[dict[str, Any]] = load_checkpoint_reviews(checkpoint_path, evidence) if checkpoint_path and resume else []
     reviewed_ids = {review["evidence_id"] for review in reviews}
     failures: list[str] = []
+    events: list[dict[str, Any]] = []
+    if checkpoint_path:
+        events.append({"type": "checkpoint_selected", "path": str(checkpoint_path)})
+    if reviews:
+        events.append({"type": "resume_loaded", "review_count": len(reviews), "path": str(checkpoint_path)})
     missing_packets = [packet for packet in packets if packet["evidence_id"] not in reviewed_ids]
+    skipped_ids = [packet["evidence_id"] for packet in packets if packet["evidence_id"] in reviewed_ids]
+    if skipped_ids:
+        events.append({"type": "resume_skipped_batches", "items_skipped": len(skipped_ids), "evidence_ids": skipped_ids[:20]})
     for idx in range(0, len(missing_packets), batch_size):
         batch = missing_packets[idx:idx + batch_size]
-        try:
-            payload = parse_json_object(call_zo_ask(semantic_prompt(batch)))
-            known_ids = {p["evidence_id"] for p in batch}
-            raw_reviews = payload.get("evidence_reviews") or []
-            if not isinstance(raw_reviews, list):
-                raise ValueError("evidence_reviews was not a list")
-            batch_reviews: list[dict[str, Any]] = []
-            for raw in raw_reviews:
-                if isinstance(raw, dict):
-                    review = normalize_review(raw, known_ids)
-                    if review and review["evidence_id"] not in reviewed_ids:
-                        batch_reviews.append(review)
-                        reviewed_ids.add(review["evidence_id"])
-            reviews.extend(batch_reviews)
-            if checkpoint_path:
-                append_checkpoint_reviews(checkpoint_path, batch_reviews)
-        except Exception as exc:
-            failures.append(f"batch {idx // batch_size + 1}: {type(exc).__name__}: {exc}")
-    status = "completed" if packets and not failures and len(reviews) == len(packets) else "partial" if reviews else "failed"
+        batch_no = idx // batch_size + 1
+        batch_reviews: list[dict[str, Any]] = []
+        for attempt in range(retries + 1):
+            events.append({"type": "provider_attempt", "provider": "zo_ask", "batch": batch_no, "attempt": attempt + 1, "items": len(batch)})
+            try:
+                payload = parse_json_object(call_zo_ask(semantic_prompt(batch), timeout_seconds=timeout_seconds))
+                known_ids = {p["evidence_id"] for p in batch}
+                raw_reviews = payload.get("evidence_reviews") or []
+                if not isinstance(raw_reviews, list):
+                    raise ValueError("evidence_reviews was not a list")
+                for raw in raw_reviews:
+                    if isinstance(raw, dict):
+                        review = normalize_review(raw, known_ids)
+                        if review and review["evidence_id"] not in reviewed_ids:
+                            batch_reviews.append(review)
+                            reviewed_ids.add(review["evidence_id"])
+                reviews.extend(batch_reviews)
+                events.append({"type": "batch_complete", "provider": "zo_ask", "batch": batch_no, "items_reviewed": len(batch_reviews)})
+                if checkpoint_path:
+                    append_checkpoint_reviews(checkpoint_path, batch_reviews)
+                    events.append({"type": "checkpoint_written", "batch": batch_no, "path": str(checkpoint_path), "items_written": len(batch_reviews)})
+                break
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                events.append({"type": "provider_error", "provider": "zo_ask", "batch": batch_no, "attempt": attempt + 1, "error": error})
+                if attempt < retries:
+                    events.append({"type": "retry_scheduled", "provider": "zo_ask", "batch": batch_no, "attempt": attempt + 2, "backoff_seconds": backoff_seconds})
+                    if backoff_seconds > 0:
+                        import time
+                        time.sleep(backoff_seconds)
+                else:
+                    failures.append(f"batch {batch_no}: {error}")
+                    events.append({"type": "fallback_to_heuristic", "batch": batch_no, "reason": error})
+    status = "complete" if packets and not failures and len(reviews) == len(packets) else "partial" if reviews else "failed"
     return reviews, {
         "provider": "zo_ask",
         "status": status,
+        "mode": "semantic-zo",
         "items_sampled": len(packets),
         "items_reviewed": len(reviews),
         "items_reused": len([review for review in reviews if review["evidence_id"] not in {packet["evidence_id"] for packet in missing_packets}]),
         "failures": failures[:5],
+        "events": events,
         "raw_private_excerpt_included": False,
         "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
     }
@@ -765,10 +995,12 @@ def load_semantic_reviews(path: Path, evidence: list[Evidence]) -> tuple[list[di
             rejected += 1
     return reviews, {
         "provider": "semantic_review_replay",
-        "status": "completed" if reviews and not rejected else "partial" if reviews else "failed",
+        "status": "complete" if reviews and not rejected else "partial" if reviews else "failed",
+        "mode": "semantic-zo",
         "items_sampled": len(known_ids),
         "items_reviewed": len(reviews),
         "failures": [f"rejected_reviews={rejected}"] if rejected else [],
+        "events": [{"type": "semantic_replay_loaded", "path": str(path), "items_reviewed": len(reviews), "rejected": rejected}],
         "raw_private_excerpt_included": False,
         "replay_path": str(path),
     }
@@ -809,43 +1041,38 @@ def analyze_axes(evidence: list[Evidence], semantic: bool, reviews: list[dict[st
     return result
 
 
-def dimension_coverage(evidence: list[Evidence], axes: dict[str, Any]) -> dict[str, Any]:
-    by_id = {item.id: item for item in evidence}
+def dimension_coverage(axes: dict[str, Any], evidence: list[Evidence], inventory: dict[str, Any]) -> dict[str, Any]:
+    evidence_by_id = {item.id: item for item in evidence}
     coverage: dict[str, Any] = {}
+    skewed = bool(inventory.get("skew_warnings"))
     for section, section_axes in axes.items():
         coverage[section] = {}
         for axis, payload in section_axes.items():
-            ids = list(payload.get("evidence_ids") or [])
+            evidence_ids = payload.get("evidence_ids") or []
             representative: list[dict[str, str]] = []
-            seen_sources: set[str] = set()
-            for evidence_id in ids:
-                item = by_id.get(evidence_id)
-                if not item:
-                    continue
-                representative.append({
-                    "id": item.id,
-                    "source": item.source,
-                    "kind": item.kind,
-                    "path": item.path,
-                })
-                seen_sources.add(item.source)
-                if len(representative) >= 3:
-                    break
-            count = len(ids)
-            score_confidence = float(payload.get("confidence", 0))
-            if count >= 6 and len(seen_sources) >= 2 and score_confidence >= 0.65:
+            for evidence_id in evidence_ids[:3]:
+                item = evidence_by_id.get(evidence_id)
+                if item:
+                    representative.append({
+                        "id": item.id,
+                        "source": item.source,
+                        "kind": item.kind,
+                        "path": item.path,
+                    })
+            count = len(evidence_ids)
+            if count >= 5 and not skewed:
                 confidence = "high"
-            elif count >= 2 and score_confidence >= 0.45:
+            elif count >= 2:
                 confidence = "medium"
             else:
                 confidence = "low"
             missing_notes: list[str] = []
-            if count == 0:
-                missing_notes.append("No direct evidence matched this dimension.")
-            elif count < 2:
-                missing_notes.append("Only one matching evidence item; treat dimension score as tentative.")
-            if len(seen_sources) <= 1 and len(evidence) > count:
-                missing_notes.append("Representative evidence comes from a narrow source set.")
+            if not count:
+                missing_notes.append(f"No direct evidence found for {axis.replace('_', ' ')}.")
+            elif confidence == "low":
+                missing_notes.append(f"Only {count} evidence item(s) supported this dimension.")
+            if skewed and confidence != "high":
+                missing_notes.append("Run-level source skew lowers confidence in this dimension.")
             coverage[section][axis] = {
                 "evidence_count": count,
                 "representative_sources": representative,
@@ -853,32 +1080,6 @@ def dimension_coverage(evidence: list[Evidence], axes: dict[str, Any]) -> dict[s
                 "missing_evidence_notes": missing_notes,
             }
     return coverage
-
-
-def low_or_skewed_coverage(inventory: dict[str, Any], dimension_payload: dict[str, Any]) -> bool:
-    if inventory.get("skew_warnings"):
-        return True
-    low = 0
-    total = 0
-    for section in dimension_payload.values():
-        for payload in section.values():
-            total += 1
-            if payload.get("confidence") == "low":
-                low += 1
-    return total > 0 and low / total >= 0.35
-
-
-def score_interpretation(profile_status: str, inventory: dict[str, Any], dimension_payload: dict[str, Any]) -> dict[str, Any]:
-    warnings = []
-    if profile_status == "insufficient_evidence":
-        warnings.append("Score is low-confidence because usable evidence was sparse or unavailable.")
-    if low_or_skewed_coverage(inventory, dimension_payload):
-        warnings.append("Score is an observed-artifact score, not a personal ceiling.")
-    warnings.extend(inventory.get("skew_warnings") or [])
-    return {
-        "primary_warning": warnings[0] if warnings else "",
-        "warnings": list(dict.fromkeys(warnings)),
-    }
 
 
 def maturity_stage(axis_scores: dict[str, Any]) -> dict[str, Any]:
@@ -956,6 +1157,63 @@ def compute_score(axis_scores: dict[str, Any], coverage: float, semantic: bool) 
     }
 
 
+def calibrated_confidence(score_confidence: float, inventory: dict[str, Any], semantic_status_value: str) -> str:
+    warnings = inventory.get("skew_warnings") or []
+    evidence_count = int(inventory.get("total_evidence_items_scanned") or 0)
+    if semantic_status_value in {"failed", "partial"} or evidence_count < 8:
+        return "low"
+    if score_confidence >= 0.68 and not warnings and semantic_status_value == "complete":
+        return "high"
+    if score_confidence >= 0.58 and not warnings:
+        return "medium"
+    return "low" if warnings else "medium"
+
+
+def calibrated_range(score: dict[str, Any], inventory: dict[str, Any], semantic_status_value: str) -> dict[str, Any]:
+    raw = int(score.get("overall", 0))
+    score_confidence = float(score.get("confidence", 0.0))
+    evidence_count = int(inventory.get("total_evidence_items_scanned") or 0)
+    warnings = inventory.get("skew_warnings") or []
+    width = 45
+    rationale: list[str] = ["Preserves deterministic raw_score and expresses uncertainty from run coverage, source skew, and semantic status."]
+    if evidence_count < 8:
+        width += 115
+        rationale.append("Evidence coverage is low, so the range is widened.")
+    elif evidence_count < 24:
+        width += 60
+        rationale.append("Evidence coverage is moderate, so the range remains somewhat wider.")
+    else:
+        rationale.append("Evidence coverage is strong enough to keep the range narrower.")
+    if warnings:
+        width += 75
+        rationale.append("Source skew warnings exist, so the range is widened.")
+    if semantic_status_value == "failed":
+        width += 95
+        rationale.append("Semantic adjudication failed, so deterministic scoring carries more uncertainty.")
+    elif semantic_status_value == "partial":
+        width += 55
+        rationale.append("Semantic adjudication was partial, so unreviewed evidence adds uncertainty.")
+    elif semantic_status_value == "complete":
+        width -= 25
+        rationale.append("Semantic adjudication completed, narrowing uncertainty.")
+    else:
+        rationale.append("No semantic adjudication was requested; range reflects deterministic heuristic uncertainty.")
+    width += round((1.0 - score_confidence) * 70)
+    width = max(35, min(260, width))
+    return {
+        "low": max(0, raw - width),
+        "high": min(1000, raw + width),
+        "rationale": " ".join(rationale),
+    }
+
+
+def score_interpretation_warning(score: dict[str, Any], inventory: dict[str, Any]) -> str | None:
+    warnings = inventory.get("skew_warnings") or []
+    if score.get("confidence", 0) < 0.55 or warnings:
+        return "Score is an observed-artifact score, not a personal ceiling. Interpret it alongside evidence coverage and source skew."
+    return None
+
+
 def risks_and_next_steps(axis_scores: dict[str, Any]) -> tuple[list[str], list[str]]:
     flat = []
     for section, axes in axis_scores.items():
@@ -983,6 +1241,48 @@ def evidence_dossier(evidence: list[Evidence], limit: int = 20) -> list[dict[str
     return [asdict(e) | {"text": e.text[:240]} for e in ranked[:limit]]
 
 
+def dimension_dossier(axes: dict[str, Any], coverage: dict[str, Any], evidence: list[Evidence]) -> dict[str, Any]:
+    evidence_by_id = {item.id: item for item in evidence}
+    result: dict[str, Any] = {}
+    for section, section_axes in axes.items():
+        result[section] = {}
+        for axis, payload in section_axes.items():
+            evidence_ids = payload.get("evidence_ids") or []
+            matched = [evidence_by_id[eid] for eid in evidence_ids if eid in evidence_by_id]
+            strongest = sorted(matched, key=lambda item: (len(item.signals), item.confidence), reverse=True)[:2]
+            representative_paths = []
+            for item in matched[:4]:
+                if item.path not in representative_paths:
+                    representative_paths.append(item.path)
+            coverage_payload = coverage.get(section, {}).get(axis, {})
+            missing_notes = list(coverage_payload.get("missing_evidence_notes") or [])
+            if not missing_notes and len(matched) < 2:
+                missing_notes.append(f"Limited direct evidence for {axis.replace('_', ' ')}.")
+            possible_false_positives: list[str] = []
+            if payload.get("score", 0) > 0 and not matched:
+                possible_false_positives.append("Keyword-level score exists without representative artifact support.")
+            if coverage_payload.get("confidence") == "low" and payload.get("score", 0) >= 0.5:
+                possible_false_positives.append("Moderate score with low coverage may reflect repeated terminology rather than demonstrated behavior.")
+            if not possible_false_positives:
+                possible_false_positives.append("No obvious false-positive pattern detected from compact evidence metadata.")
+            result[section][axis] = {
+                "strongest_positive_evidence": [
+                    {
+                        "id": item.id,
+                        "source": item.source,
+                        "kind": item.kind,
+                        "path": item.path,
+                        "signals": item.signals,
+                    }
+                    for item in strongest
+                ],
+                "weakest_or_missing_evidence": missing_notes or ["Evidence exists, but broader corroboration would improve confidence."],
+                "possible_false_positives": possible_false_positives,
+                "representative_artifact_paths": representative_paths,
+            }
+    return result
+
+
 def generated_artifacts(artifact_dir: Path) -> list[str]:
     if not artifact_dir.exists():
         return []
@@ -991,14 +1291,170 @@ def generated_artifacts(artifact_dir: Path) -> list[str]:
 
 def run_limitations(profile: dict[str, Any], inventory: dict[str, Any]) -> list[str]:
     limitations = list(inventory.get("skew_warnings") or [])
-    interpretation = profile.get("score_interpretation") or {}
-    limitations.extend(interpretation.get("warnings") or [])
     semantic = profile.get("semantic", {})
     if semantic.get("failures"):
         limitations.append("Semantic provider failures were recorded; inspect semantic.failures before using the score externally.")
     if profile.get("profile_status") == "insufficient_evidence":
         limitations.append("Profile status is insufficient_evidence.")
     return limitations or ["No major run limitations detected beyond normal observed-evidence caveats."]
+
+
+def fallback_events(semantic: dict[str, Any]) -> list[dict[str, Any]]:
+    fallback_types = {"provider_error", "retry_scheduled", "fallback_to_heuristic"}
+    return [
+        event
+        for event in semantic.get("events", [])
+        if event.get("type") in fallback_types
+    ]
+
+
+def scoring_confidence_risks(profile: dict[str, Any], inventory: dict[str, Any]) -> list[str]:
+    risks: list[str] = []
+    evidence_count = int(profile.get("coverage", {}).get("evidence_records") or 0)
+    semantic_status_value = str(profile.get("semantic_status") or profile.get("semantic", {}).get("status") or "unknown")
+    score_range = profile.get("calibrated_range") or profile.get("score", {}).get("range") or {}
+    width = int(score_range.get("high", 0)) - int(score_range.get("low", 0))
+    if evidence_count < 8:
+        risks.append("Sparse evidence count makes the score highly sensitive to one or two artifacts.")
+    for warning in inventory.get("skew_warnings") or []:
+        risks.append(warning)
+    if semantic_status_value in {"failed", "partial", "not_requested"}:
+        risks.append(f"Semantic status is {semantic_status_value}; deterministic heuristics materially affect the score.")
+    if width >= 250:
+        risks.append(f"Calibrated score range is wide ({width} points), indicating high volatility.")
+    if profile.get("score_interpretation_warning"):
+        risks.append(str(profile["score_interpretation_warning"]))
+    return list(dict.fromkeys(risks)) or ["No major scoring volatility indicator detected from run metadata."]
+
+
+def build_dogfood_report(profile: dict[str, Any], inventory: dict[str, Any], artifact_dir: Path, elapsed_seconds: float) -> dict[str, Any]:
+    semantic = profile.get("semantic", {})
+    coverage = profile.get("coverage", {})
+    events = semantic.get("events", [])
+    fallback = fallback_events(semantic)
+    generated = generated_artifacts(artifact_dir)
+    return {
+        "product": "AI Wizard",
+        "report_type": "dogfood_evaluator_diagnostics",
+        "generated_at": now_iso(),
+        "run_id": profile.get("run_id"),
+        "run_dir": str(artifact_dir),
+        "runtime_summary": {
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "mode": profile.get("mode"),
+            "depth": profile.get("depth"),
+            "profile_status": profile.get("profile_status"),
+            "artifacts_written": generated,
+        },
+        "evidence_inventory_summary": {
+            "evidence_records": coverage.get("evidence_records", 0),
+            "included_source_types": coverage.get("included_source_types") or [],
+            "skipped_or_unavailable_source_types": coverage.get("skipped_or_unavailable_source_types") or [],
+            "top_roots": coverage.get("top_roots") or [],
+            "skew_warnings": inventory.get("skew_warnings") or coverage.get("skew_warnings") or [],
+            "raw_private_evidence_included": False,
+        },
+        "semantic_status": {
+            "mode": profile.get("semantic_mode"),
+            "status": profile.get("semantic_status"),
+            "provider": semantic.get("provider"),
+            "requested": semantic.get("requested"),
+            "items_sampled": semantic.get("items_sampled"),
+            "items_reviewed": semantic.get("items_reviewed"),
+            "failures": semantic.get("failures") or [],
+            "note": semantic.get("note"),
+        },
+        "retry_timeout_fallback_events": {
+            "event_count": len(fallback),
+            "events": fallback[:20],
+            "all_event_types": compact_counts({
+                str(event.get("type", "unknown")): sum(1 for e in events if e.get("type") == event.get("type", "unknown"))
+                for event in events
+            }),
+        },
+        "scoring_volatility": {
+            "raw_score": profile.get("raw_score"),
+            "calibrated_range": profile.get("calibrated_range"),
+            "score_range": profile.get("score", {}).get("range"),
+            "confidence": profile.get("confidence"),
+            "confidence_risks": scoring_confidence_risks(profile, inventory),
+        },
+        "suggested_verification": [
+            "python3 -m pytest Skills/ai-wizard/tests/test_ai_wizard.py -q",
+            "python3 -m py_compile Skills/ai-wizard/scripts/ai_wizard.py",
+            "python3 Skills/ai-wizard/scripts/ai_wizard.py profile --mode baseline --input Skills/ai-wizard/tests/fixtures/baseline --no-semantic --dogfood --skip-history --out /tmp/ai-wizard-dogfood",
+            "python3 Skills/ai-wizard/scripts/ai_wizard.py report --run <run-dir>",
+        ],
+    }
+
+
+def render_dogfood_markdown(report: dict[str, Any]) -> str:
+    coverage = report.get("evidence_inventory_summary", {})
+    semantic = report.get("semantic_status", {})
+    fallback = report.get("retry_timeout_fallback_events", {})
+    volatility = report.get("scoring_volatility", {})
+    lines = [
+        "---",
+        f"created: {datetime.now(timezone.utc).date().isoformat()}",
+        f"last_edited: {datetime.now(timezone.utc).date().isoformat()}",
+        "version: 0.1",
+        "provenance: ai-wizard",
+        "---",
+        "",
+        "# AI Wizard Dogfood Diagnostics",
+        "",
+        "This report summarizes evaluator behavior without raw private evidence.",
+        "",
+        "## Runtime",
+        "",
+        f"- Run ID: `{report.get('run_id')}`",
+        f"- Mode/depth: `{report.get('runtime_summary', {}).get('mode')}` / `{report.get('runtime_summary', {}).get('depth')}`",
+        f"- Status: `{report.get('runtime_summary', {}).get('profile_status')}`",
+        f"- Elapsed seconds: {report.get('runtime_summary', {}).get('elapsed_seconds')}",
+        "",
+        "## Evidence Inventory",
+        "",
+        f"- Evidence records: {coverage.get('evidence_records', 0)}",
+        f"- Included source types: {', '.join(coverage.get('included_source_types') or []) or 'none'}",
+        f"- Missing/unavailable source types: {', '.join(coverage.get('skipped_or_unavailable_source_types') or []) or 'none'}",
+        f"- Private raw evidence included: {coverage.get('raw_private_evidence_included')}",
+    ]
+    for warning in (coverage.get("skew_warnings") or [])[:5]:
+        lines.append(f"- Coverage warning: {warning}")
+    lines.extend([
+        "",
+        "## Semantic Reliability",
+        "",
+        f"- Provider: `{semantic.get('provider')}`",
+        f"- Mode/status: `{semantic.get('mode')}` / `{semantic.get('status')}`",
+        f"- Requested: {semantic.get('requested')}",
+        f"- Items sampled/reviewed: {semantic.get('items_sampled')} / {semantic.get('items_reviewed')}",
+        f"- Note: {semantic.get('note')}",
+    ])
+    for failure in (semantic.get("failures") or [])[:5]:
+        lines.append(f"- Failure: {failure}")
+    lines.extend([
+        "",
+        "## Retries, Timeouts, Fallbacks",
+        "",
+        f"- Retry/timeout/fallback event count: {fallback.get('event_count', 0)}",
+    ])
+    for event in (fallback.get("events") or [])[:8]:
+        lines.append(f"- `{event.get('type')}`: {event.get('error') or event.get('reason') or event.get('provider') or 'recorded'}")
+    lines.extend([
+        "",
+        "## Scoring Volatility",
+        "",
+        f"- Raw score: {volatility.get('raw_score')}",
+        f"- Calibrated range: {volatility.get('calibrated_range')}",
+        f"- Score range: {volatility.get('score_range')}",
+        f"- Confidence: {volatility.get('confidence')}",
+    ])
+    for risk in (volatility.get("confidence_risks") or [])[:8]:
+        lines.append(f"- Risk: {risk}")
+    lines.extend(["", "## Suggested Verification", ""])
+    lines.extend(f"- `{cmd}`" for cmd in report.get("suggested_verification", []))
+    return "\n".join(lines) + "\n"
 
 
 def build_run_audit(profile: dict[str, Any], inventory: dict[str, Any], artifact_dir: Path, elapsed_seconds: float) -> dict[str, Any]:
@@ -1028,9 +1484,8 @@ def write_json(path: Path, data: Any) -> None:
 
 def render_markdown(profile: dict[str, Any], include_private: bool = False) -> str:
     coverage = profile.get("coverage", {})
-    score_warning = (profile.get("score_interpretation") or {}).get("primary_warning")
-    coverage_sources = ", ".join(sorted((coverage.get("source_counts") or {}).keys())) or "none"
-    coverage_kinds = ", ".join(sorted((coverage.get("kind_counts") or {}).keys())) or "none"
+    skew_warnings = coverage.get("skew_warnings") or []
+    top_roots = ", ".join(f"{item['name']} ({item['count']})" for item in coverage.get("top_roots", [])[:4]) or "none"
     lines = [
         "---",
         f"created: {datetime.now(timezone.utc).date().isoformat()}",
@@ -1042,27 +1497,62 @@ def render_markdown(profile: dict[str, Any], include_private: bool = False) -> s
         "# AI Wizard Profile",
         "",
         f"**Stage:** {profile['maturity_stage']['level']} — {profile['maturity_stage']['label']}",
+        f"**Profile Status:** {profile['profile_status']}",
         f"**Archetype:** {profile['archetype']['name']}",
-        f"**Score:** {profile['score']['overall']}/1000 ({profile['score']['band']})",
-        f"**Score Range:** {profile['score']['range']['low']}–{profile['score']['range']['high']}",
-        f"**Confidence:** {profile['score']['confidence']}",
+        f"**Raw Score:** {profile['raw_score']}/1000 ({profile['score']['band']})",
+        f"**Calibrated Range:** {profile['calibrated_range']['low']}–{profile['calibrated_range']['high']}",
+        f"**Confidence:** {profile['confidence']}",
         f"**Semantic:** {profile['semantic']['provider']} / {profile['semantic']['status']}",
-        f"**Coverage:** {coverage.get('evidence_records', 0)} items; sources={coverage_sources}; kinds={coverage_kinds}",
-        *([f"**Interpretation Warning:** {score_warning}"] if score_warning else []),
-        "",
-        "## Coverage Summary",
-        "",
-        *((f"- {warning}" for warning in (coverage.get("skew_warnings") or [])[:4]) if coverage.get("skew_warnings") else ["- No major coverage skew warning was detected."]),
-        *([f"- Low-confidence dimensions: {', '.join([axis.replace('_', ' ') for section in (coverage.get('dimensions') or {}).values() for axis, payload in section.items() if payload.get('confidence') == 'low'][:8])}."] if any(payload.get("confidence") == "low" for section in (coverage.get("dimensions") or {}).values() for payload in section.values()) else []),
+        f"**Evidence Coverage:** {coverage.get('evidence_records', 0)} items; roots: {top_roots}",
+    ]
+    lines.append(f"**Calibration Rationale:** {profile['calibrated_range']['rationale']}")
+    if profile.get("score_interpretation_warning"):
+        lines.append(f"**Score Warning:** {profile['score_interpretation_warning']}")
+    if skew_warnings:
+        lines.append(f"**Coverage Warning:** {skew_warnings[0]}")
+    lines.extend([
         "",
         "## Strength Map",
         "",
-    ]
+    ])
     for section, axes in profile["axes"].items():
         lines.append(f"### {section.replace('_', ' ').title()}")
         for axis, payload in axes.items():
-            lines.append(f"- **{axis.replace('_', ' ').title()}**: {payload['score']} confidence {payload['confidence']}")
+            coverage_payload = profile.get("dimension_coverage", {}).get(section, {}).get(axis, {})
+            lines.append(
+                f"- **{axis.replace('_', ' ').title()}**: {payload['score']} confidence {payload['confidence']} "
+                f"coverage {coverage_payload.get('confidence', 'unknown')} ({coverage_payload.get('evidence_count', 0)} items)"
+            )
         lines.append("")
+    lines.extend(["## Dimension Evidence Review", ""])
+    dimension_reviews = profile.get("dimension_dossier", {})
+    for section, axes in dimension_reviews.items():
+        lines.append(f"### {section.replace('_', ' ').title()}")
+        for axis, payload in axes.items():
+            lines.append(f"#### {axis.replace('_', ' ').title()}")
+            strongest = payload.get("strongest_positive_evidence") or []
+            if strongest:
+                lines.append("- Strongest positive evidence:")
+                for item in strongest[:2]:
+                    lines.append(f"  - `{item['id']}` {item['source']} {item['kind']} `{item['path']}`")
+            else:
+                lines.append("- Strongest positive evidence: none found")
+            weakest = payload.get("weakest_or_missing_evidence") or ["No note."]
+            lines.append(f"- Weakest or missing evidence: {weakest[0]}")
+            false_positive = payload.get("possible_false_positives") or ["No obvious false-positive pattern detected."]
+            lines.append(f"- Possible false positives: {false_positive[0]}")
+            paths = payload.get("representative_artifact_paths") or []
+            lines.append(f"- Representative artifact paths: {', '.join(f'`{path}`' for path in paths[:4]) if paths else 'none'}")
+        lines.append("")
+    lines.extend(["## Coverage Summary", ""])
+    lines.append(f"- Evidence items scanned: {coverage.get('evidence_records', 0)}")
+    lines.append(f"- Included source types: {', '.join(coverage.get('included_source_types') or []) or 'none'}")
+    skipped = coverage.get("skipped_or_unavailable_source_types") or []
+    if skipped:
+        lines.append(f"- Missing or unavailable evidence: {', '.join(skipped[:4])}")
+    for warning in skew_warnings[:3]:
+        lines.append(f"- Warning: {warning}")
+    lines.append("")
     lines.extend(["## Risks", ""])
     lines.extend(f"- {risk}" for risk in profile["risks"])
     lines.extend(["", "## Next Build Plan", ""])
@@ -1077,13 +1567,14 @@ def render_markdown(profile: dict[str, Any], include_private: bool = False) -> s
 def render_share_card(profile: dict[str, Any]) -> str:
     stage = profile["maturity_stage"]
     score = profile["score"]
-    coverage = profile.get("coverage", {})
-    warnings = (profile.get("score_interpretation") or {}).get("warnings") or []
     top_axes = []
     for section, axes in profile["axes"].items():
         for axis, payload in axes.items():
             top_axes.append((payload["score"], axis))
     top = ", ".join(axis.replace("_", " ") for _, axis in sorted(top_axes, reverse=True)[:3])
+    coverage = profile.get("coverage", {})
+    warning = profile.get("score_interpretation_warning")
+    roots = ", ".join(item["name"] for item in coverage.get("top_roots", [])[:3]) or "none"
     return "\n".join([
         "---",
         f"created: {datetime.now(timezone.utc).date().isoformat()}",
@@ -1096,10 +1587,11 @@ def render_share_card(profile: dict[str, Any]) -> str:
         "",
         f"**Profile:** Stage {stage['level']} — {stage['label']}",
         f"**Archetype:** {profile['archetype']['name']}",
-        f"**Score:** {score['overall']}/1000 (range {score['range']['low']}–{score['range']['high']})",
+        f"**Raw Score:** {profile['raw_score']}/1000 (calibrated range {profile['calibrated_range']['low']}–{profile['calibrated_range']['high']})",
+        f"**Confidence:** {profile['confidence']}",
         f"**Strongest signals:** {top}",
-        f"**Coverage:** {coverage.get('evidence_records', 0)} evidence items across {len(coverage.get('source_counts') or {})} source type(s)",
-        f"**Coverage note:** {warnings[0] if warnings else 'No major source skew warning detected.'}",
+        f"**Coverage:** {coverage.get('evidence_records', 0)} observed items across {', '.join(coverage.get('included_source_types') or []) or 'no source types'}; top roots: {roots}",
+        *( [f"**Interpretation warning:** {warning}"] if warning else [] ),
         "",
         "This public summary is redacted. It does not include raw private evidence.",
         "",
@@ -1148,7 +1640,29 @@ def make_profile(args: argparse.Namespace, artifact_dir: Path | None = None) -> 
     semantic, semantic_payload, analysis_method, methodology_warning = validate_semantic_provider(args)
     evidence: list[Evidence] = []
     if args.mode == "zo-native":
-        evidence.extend(collect_workspace_artifacts(limit=args.artifact_limit))
+        sources = [s.strip() for s in getattr(args, "sources", "workspace,conversations,git").split(",") if s.strip()]
+        unknown = set(sources) - {"workspace", "conversations", "git"}
+        if unknown:
+            raise SystemExit(f"Unknown evidence sources: {', '.join(sorted(unknown))}")
+        limit = args.artifact_limit
+        # Allocation: workspace 60%, conversations 30%, git 10% of the cap,
+        # rebalanced when a source is disabled or under-delivers.
+        weights = {"workspace": 0.6, "conversations": 0.3, "git": 0.1}
+        active = {s: weights[s] for s in sources}
+        total_weight = sum(active.values()) or 1.0
+        budgets = {s: max(1, int(limit * w / total_weight)) for s, w in active.items()}
+        collected: dict[str, list[Evidence]] = {}
+        if "conversations" in budgets:
+            trace_dirs = [Path(p).expanduser() for p in getattr(args, "trace_dir", []) or []] or None
+            collected["conversations"] = collect_conversation_traces(limit=budgets["conversations"], trace_dirs=trace_dirs)
+        if "git" in budgets:
+            collected["git"] = collect_git_history(limit=budgets["git"])
+        shortfall = sum(budgets[s] - len(collected.get(s, [])) for s in budgets if s != "workspace")
+        if "workspace" in budgets:
+            collected["workspace"] = collect_workspace_artifacts(limit=budgets["workspace"] + max(0, shortfall))
+        for s in ("workspace", "conversations", "git"):
+            evidence.extend(collected.get(s, []))
+        evidence = evidence[:limit]
     if args.input:
         evidence.extend(collect_export_artifacts(Path(args.input), source=args.mode, limit=args.artifact_limit, max_scan_files=args.max_scan_files))
     if args.mode == "baseline" and not args.input:
@@ -1158,7 +1672,7 @@ def make_profile(args: argparse.Namespace, artifact_dir: Path | None = None) -> 
     semantic_reviews: list[dict[str, Any]] = []
     provider = getattr(args, "semantic_provider", "auto")
     replay_path = getattr(args, "semantic_reviews", None)
-    if semantic and replay_path and evidence:
+    if replay_path and evidence:
         semantic_reviews, review_status = load_semantic_reviews(Path(replay_path), evidence)
         semantic_payload.update(review_status)
         methodology_warning = "Semantic scores replay saved adjudication reviews; no new semantic provider call was made."
@@ -1171,24 +1685,32 @@ def make_profile(args: argparse.Namespace, artifact_dir: Path | None = None) -> 
             review_cap,
             checkpoint_path=checkpoint,
             resume=getattr(args, "semantic_resume", False),
+            retries=getattr(args, "semantic_retries", 1),
+            timeout_seconds=getattr(args, "semantic_timeout", 90),
+            backoff_seconds=getattr(args, "semantic_backoff", 0.25),
         )
         semantic_payload.update(review_status)
-        if review_status["status"] == "completed":
+        if review_status["status"] == "complete":
             semantic_payload["note"] = "Zo semantic provider completed evidence adjudication and wrote replayable reviews."
         elif review_status["status"] == "partial":
             semantic_payload["note"] = "Zo semantic provider partially completed; unreviewed evidence used deterministic fallback."
         else:
             semantic_payload["note"] = "Zo semantic provider failed; deterministic fallback used for scoring."
-    axes = analyze_axes(evidence, semantic=semantic, reviews=semantic_reviews)
-    inventory = build_inventory(args.mode, Path(args.input) if args.input else None, evidence, semantic_payload)
-    dimension_payload = dimension_coverage(evidence, axes)
+    semantic_complete = semantic_payload.get("mode") == "semantic-zo" and semantic_payload.get("status") == "complete"
+    axes = analyze_axes(evidence, semantic=semantic_complete, reviews=semantic_reviews)
     reference_records = min(args.semantic_cap, 24) if args.depth == "capped" else 250
     coverage = min(1.0, len(evidence) / max(1, reference_records))
-    score = compute_score(axes, coverage=coverage, semantic=semantic)
+    score = compute_score(axes, coverage=coverage, semantic=semantic_complete)
+    inventory = build_inventory(args.mode, Path(args.input) if args.input else None, evidence, semantic_payload)
+    dimension_cov = dimension_coverage(axes, evidence, inventory)
+    semantic_status_value = semantic_payload.get("status", "failed")
+    calibrated = calibrated_range(score, inventory, semantic_status_value)
+    confidence_label = calibrated_confidence(float(score.get("confidence", 0.0)), inventory, semantic_status_value)
     stage = maturity_stage(axes)
     risks, next_steps = risks_and_next_steps(axes)
     run_basis = f"{now_iso()}-{args.mode}-{len(evidence)}-{score['overall']}"
     run_id = hashlib.sha1(run_basis.encode()).hexdigest()[:12]
+    score_warning = score_interpretation_warning(score, inventory)
     profile = {
         "product": "AI Wizard",
         "profile_type": "observed_ai_fluency_profile",
@@ -1197,30 +1719,37 @@ def make_profile(args: argparse.Namespace, artifact_dir: Path | None = None) -> 
         "generated_at": now_iso(),
         "mode": args.mode,
         "depth": "deterministic" if args.no_semantic else args.depth,
+        "semantic_mode": semantic_payload.get("mode", "heuristic"),
+        "semantic_status": semantic_payload.get("status", "failed"),
+        "semantic_events": semantic_payload.get("events", []),
         "semantic": semantic_payload,
         "analysis_method": analysis_method,
         "methodology_warning": methodology_warning,
+        "score_interpretation_warning": score_warning,
         "coverage": {"evidence_records": len(evidence), "cap": args.semantic_cap if args.depth == "capped" else None},
+        "dimension_coverage": dimension_cov,
         "maturity_stage": stage,
         "archetype": archetype(score["overall"]),
+        "raw_score": score["overall"],
+        "calibrated_range": calibrated,
+        "confidence": confidence_label,
         "score": score,
         "axes": axes,
         "risks": risks,
         "next_build_plan": next_steps,
         "evidence_dossier": evidence_dossier(evidence),
+        "dimension_dossier": dimension_dossier(axes, dimension_cov, evidence),
         "semantic_reviews": semantic_reviews,
     }
     profile["coverage"] |= {
         "source_counts": inventory["used"]["source_counts"],
         "kind_counts": inventory["used"]["kind_counts"],
-        "root_counts": inventory["used"]["root_counts"],
-        "top_roots": inventory["used"]["top_roots"],
-        "included_source_types": inventory["used"]["included_source_types"],
+        "source_type_counts": inventory["used"]["source_type_counts"],
+        "top_roots": inventory["top_roots"],
+        "included_source_types": inventory["included_source_types"],
         "skipped_or_unavailable_source_types": inventory["skipped_or_unavailable_source_types"],
         "skew_warnings": inventory["skew_warnings"],
-        "dimensions": dimension_payload,
     }
-    profile["score_interpretation"] = score_interpretation(profile["profile_status"], inventory, dimension_payload)
     return profile, inventory
 
 
@@ -1232,12 +1761,12 @@ def command_scan(args: argparse.Namespace) -> None:
 def command_profile(args: argparse.Namespace) -> None:
     started = perf_counter()
     out_root = Path(args.out) if args.out else build_artifact_root()
-    provisional_basis = f"{now_iso()}-{args.mode}-{args.input or ''}-{args.semantic_provider}-{args.semantic_cap}"
+    provisional_basis = f"{args.mode}-{args.input or ''}-{args.semantic_provider}-{args.semantic_cap}"
     provisional_id = hashlib.sha1(provisional_basis.encode()).hexdigest()[:12]
     artifact_dir = out_root / provisional_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
     profile, inventory = make_profile(args, artifact_dir=artifact_dir)
-    final_dir = out_root / profile["run_id"]
+    final_dir = artifact_dir if args.semantic_provider == "zo" else out_root / profile["run_id"]
     if final_dir != artifact_dir:
         if final_dir.exists():
             artifact_dir = final_dir
@@ -1245,15 +1774,29 @@ def command_profile(args: argparse.Namespace) -> None:
             artifact_dir.rename(final_dir)
             artifact_dir = final_dir
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    elapsed_before_reports = perf_counter() - started
+    if args.dogfood:
+        dogfood_report = build_dogfood_report(profile, inventory, artifact_dir, elapsed_before_reports)
+        dogfood_json_path = artifact_dir / "dogfood-report.json"
+        dogfood_md_path = artifact_dir / "dogfood-report.md"
+        write_json(dogfood_json_path, dogfood_report)
+        dogfood_md_path.write_text(render_dogfood_markdown(dogfood_report))
+        profile["dogfood_report"] = {
+            "path": str(dogfood_json_path),
+            "markdown_path": str(dogfood_md_path),
+            "report_type": dogfood_report["report_type"],
+            "generated_at": dogfood_report["generated_at"],
+        }
     write_json(artifact_dir / "inventory.json", inventory)
     write_json(artifact_dir / "profile.json", profile)
     write_json(artifact_dir / "score.json", profile["score"])
     reviews = profile.get("semantic_reviews") or []
     if reviews:
-        (artifact_dir / "semantic-reviews.jsonl").write_text(
-            "\n".join(json.dumps(review, sort_keys=True) for review in reviews) + "\n"
-        )
+        reviews_path = artifact_dir / "semantic-reviews.jsonl"
+        if not reviews_path.exists():
+            reviews_path.write_text("\n".join(json.dumps(review, sort_keys=True) for review in reviews) + "\n")
         profile["semantic"]["replay_path"] = str(artifact_dir / "semantic-reviews.jsonl")
+        profile["semantic_events"] = profile["semantic"].get("events", [])
         write_json(artifact_dir / "profile.json", profile)
     (artifact_dir / "dossier.md").write_text(render_markdown(profile, include_private=args.include_excerpts))
     (artifact_dir / "share-card.md").write_text(render_share_card(profile))
@@ -1282,8 +1825,11 @@ def command_profile(args: argparse.Namespace) -> None:
     print(json.dumps({
         "run_id": profile["run_id"],
         "artifact_dir": str(artifact_dir),
+        "raw_score": profile["raw_score"],
         "score": profile["score"]["overall"],
+        "calibrated_range": profile["calibrated_range"],
         "score_range": profile["score"]["range"],
+        "confidence": profile["confidence"],
         "stage": profile["maturity_stage"],
     }, indent=2))
 
@@ -1360,12 +1906,18 @@ def parser() -> argparse.ArgumentParser:
     prof.add_argument("--depth", choices=["capped", "full"], default="capped")
     prof.add_argument("--semantic-cap", type=int, default=120)
     prof.add_argument("--artifact-limit", type=int, default=250)
+    prof.add_argument("--sources", default="workspace,conversations,git", help="Comma-separated zo-native evidence sources: workspace, conversations, git.")
+    prof.add_argument("--trace-dir", action="append", help="Extra conversation-trace directory (repeatable); overrides auto-detected trace dirs.")
     prof.add_argument("--max-scan-files", type=int, default=250, help="Maximum export files to inspect before stopping; bounds large Claude/Codex histories.")
     prof.add_argument("--semantic-provider", choices=["auto", "heuristic", "zo"], default="auto", help="Semantic provider contract. auto currently uses heuristic fallback unless upgraded.")
     prof.add_argument("--semantic-reviews", help="Replay a saved semantic-reviews.jsonl file instead of calling a semantic provider.")
     prof.add_argument("--semantic-resume", action="store_true", help="Reuse semantic-reviews.jsonl in the target run directory and only request missing Zo reviews.")
+    prof.add_argument("--semantic-retries", type=int, default=1, help="Retry count for each Zo semantic batch before falling back to heuristic scoring.")
+    prof.add_argument("--semantic-timeout", type=float, default=90, help="Timeout in seconds for each Zo semantic provider call.")
+    prof.add_argument("--semantic-backoff", type=float, default=0.25, help="Backoff in seconds between Zo semantic provider retries.")
     prof.add_argument("--no-semantic", action="store_true")
     prof.add_argument("--include-excerpts", action="store_true")
+    prof.add_argument("--dogfood", action="store_true", help="Write evaluator diagnostics without raw private evidence.")
     prof.add_argument("--skip-history", action="store_true", help="Do not write this run to the persistent history DB")
     prof.add_argument("--out")
     prof.set_defaults(func=command_profile)
